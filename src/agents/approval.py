@@ -1,15 +1,17 @@
-"""ApprovalAgent — VP-level review with a reflection / critique loop.
+"""ApprovalAgent — VP-level review with a real reflection loop.
 
 Policy:
-  * Any validation error            -> REJECT (with reasoning)
-  * Fraud signals in the raw text    -> REJECT (escalate as suspicious)
-  * Amount > $10,000                 -> heightened scrutiny, still approvable
-                                       if validation is clean
-  * Clean invoice under threshold    -> APPROVE
+  * validation errors (stock, unknown SKU, bad data, total mismatch) -> REJECT
+  * missing payee / items / total, low extraction confidence           -> HOLD
+  * critical fraud signals (wire pressure, backdated due date)          -> REJECT (fraud)
+  * vendor identity questions, zero amounts, foreign currency           -> HOLD
+  * clean invoice                                                      -> APPROVE
+    (>$10K gets an explicit scrutiny note but is still payable)
 
-The draft decision is then passed through a critique step (LLM auditor or
-local policy critic). If the critic does not uphold the decision, the agent
-revises once and finalizes.
+The draft then goes through a critic that sees the RAW document text —
+not just the extraction — so it can catch artefacts like garbled payee
+names. Verdicts: uphold | hold. The critic routes uncertainty to humans;
+it never flips approve<->reject on its own, in either direction.
 """
 from __future__ import annotations
 
@@ -17,74 +19,105 @@ from typing import List
 
 from .base import BaseAgent
 from ..llm import LLMClient
-from ..models import ApprovalDecision, Invoice, ValidationResult
-from ..tools import detect_fraud_signals
+from ..models import ApprovalDecision, Invoice, RiskSignal, ValidationResult
+from ..tools import analyze_risk
 
 HIGH_VALUE_THRESHOLD = 10_000.0
+LOW_CONFIDENCE_THRESHOLD = 0.5
+
+HOLD_CODES = {"missing_vendor", "missing_items", "missing_total"}
 
 
 class ApprovalAgent(BaseAgent):
     name = "approval"
 
-    def __init__(self, llm: LLMClient):
+    def __init__(self, llm: LLMClient, tracer=None, skus=None):
+        super().__init__(tracer)
         self.llm = llm
+        self.skus = skus or []
 
-    def _draft(self, inv: Invoice, vr: ValidationResult) -> ApprovalDecision:
-        risk_flags: List[str] = []
-        fraud = detect_fraud_signals(inv.raw_text)
-        if fraud:
-            risk_flags.append("fraud_signals:" + ",".join(fraud))
+    def run(self, inv: Invoice, vr: ValidationResult) -> ApprovalDecision:
+        signals = self.use_tool(
+            "risk.analyze",
+            {"source": inv.source_file},
+            lambda: analyze_risk(inv.raw_text, inv.invoice_date, inv.due_date),
+        )
+        for s in signals:
+            self.log(f"risk signal [{s.severity}]: {s.signal} — {s.evidence}")
 
+        draft = self._draft(inv, vr, signals)
+        self.log(f"draft: {'APPROVE' if draft.approved and not draft.held else 'HOLD' if draft.held else 'REJECT'}")
+
+        critique = self.use_tool(
+            "llm.critique",
+            {"mode": self.llm.mode},
+            lambda: self.llm.critique_decision(inv.raw_text, inv.to_dict(),
+                                              vr.to_dict(), draft.to_dict(),
+                                              inventory_skus=self.skus),
+        )
+        self.log(f"critic ({self.llm.mode}): {critique.get('verdict')} — "
+                 f"{str(critique.get('notes', ''))[:140]}")
+
+        if critique.get("verdict") == "hold" and not draft.held:
+            draft.held = True
+            draft.approved = False
+            draft.reasoning += f" [Held after critique: {critique.get('notes', '')}]"
+            self.log("critic diverted decision to human review")
+        draft.critique_notes = str(critique.get("notes", ""))
+        extra = [f for f in critique.get("risk_flags", []) if f not in draft.risk_flags]
+        draft.risk_flags.extend(extra)
+        self.log(f"final: {'APPROVE' if draft.approved and not draft.held else 'HOLD' if draft.held else 'REJECT'}")
+        return draft
+
+    def _draft(self, inv: Invoice, vr: ValidationResult,
+               signals: List[RiskSignal]) -> ApprovalDecision:
+        risk_flags = [f"{s.severity}:{s.signal}" for s in signals]
         total = inv.total_amount or 0.0
-        if total > HIGH_VALUE_THRESHOLD:
-            risk_flags.append("high_value")
+
+        # Missing fundamentals -> human, not auto-reject.
+        missing = [i for i in vr.errors() if i.code in HOLD_CODES]
+        if missing:
+            return ApprovalDecision(
+                approved=False, held=True,
+                reasoning="Held for review: " + "; ".join(i.message for i in missing),
+                risk_flags=risk_flags)
 
         errors = vr.errors()
         if errors:
-            reasons = "; ".join(e.message for e in errors)
             return ApprovalDecision(
                 approved=False,
-                reasoning=f"Rejected: validation failed — {reasons}.",
-                risk_flags=risk_flags,
-            )
-        if fraud:
+                reasoning="Rejected: " + "; ".join(i.message for i in errors),
+                risk_flags=risk_flags)
+
+        critical = [s for s in signals if s.severity == "critical"]
+        if critical:
             return ApprovalDecision(
                 approved=False,
-                reasoning=(f"Rejected: fraud indicators detected ({', '.join(fraud)}). "
-                           "Urgency/wire-transfer language with an unverifiable vendor is escalated, not paid."),
-                risk_flags=risk_flags,
-            )
+                reasoning="Rejected as suspected fraud: "
+                          + "; ".join(s.evidence for s in critical),
+                risk_flags=risk_flags)
+
+        holds = []
+        if any(s.signal == "vendor_name_change" for s in signals):
+            holds.append("vendor identity changed — verify before paying (possible BEC)")
+        if total <= 0:
+            holds.append(f"non-positive total ${total:,.2f}")
+        if inv.currency != "USD":
+            holds.append(f"foreign currency {inv.currency} — no FX handling")
+        if inv.extraction_confidence < LOW_CONFIDENCE_THRESHOLD:
+            holds.append(f"low extraction confidence {inv.extraction_confidence:.2f}")
+        if holds:
+            return ApprovalDecision(
+                approved=False, held=True,
+                reasoning="Held for review: " + "; ".join(holds),
+                risk_flags=risk_flags)
+
         if total > HIGH_VALUE_THRESHOLD:
-            reasoning = (f"Approved with scrutiny: ${total:,.2f} exceeds the ${HIGH_VALUE_THRESHOLD:,.0f} "
-                         "threshold, but validation is clean, the vendor is identifiable, and no fraud "
-                         "signals were found.")
+            risk_flags.append("info:high_value_scrutiny")
+            reasoning = (f"Approved with scrutiny: ${total:,.2f} exceeds the "
+                         f"${HIGH_VALUE_THRESHOLD:,.0f} threshold, but validation is clean "
+                         f"and no fraud signals were found.")
         else:
-            reasoning = (f"Approved: ${total:,.2f} within policy, validation passed, "
-                         "no fraud signals detected.")
+            reasoning = (f"Approved: ${total:,.2f} {inv.currency} within policy, "
+                         f"validation passed, no fraud signals.")
         return ApprovalDecision(approved=True, reasoning=reasoning, risk_flags=risk_flags)
-
-    def run(self, inv: Invoice, vr: ValidationResult) -> ApprovalDecision:
-        draft = self._draft(inv, vr)
-        self.log(f"draft decision: {'APPROVE' if draft.approved else 'REJECT'}")
-
-        # Critique / reflection loop.
-        critique = self.llm.critique_decision(inv.to_dict(), vr.to_dict(), draft.to_dict())
-        self.log(f"critic: {'upheld' if critique.get('uphold') else 'challenged'} — "
-                 f"{critique.get('notes', '')[:120]}")
-
-        if not critique.get("uphold"):
-            # One revision: flip only if the critic found a concrete safety problem.
-            revised = ApprovalDecision(
-                approved=False,
-                reasoning=(draft.reasoning + " [Revised after critique: "
-                           + str(critique.get("notes", "")) + "]"),
-                critique_notes=str(critique.get("notes", "")),
-                risk_flags=list(dict.fromkeys(draft.risk_flags + critique.get("risk_flags", []))),
-            )
-            self.log("decision revised after critique: REJECT")
-            return revised
-
-        draft.critique_notes = str(critique.get("notes", ""))
-        draft.risk_flags = list(dict.fromkeys(draft.risk_flags + critique.get("risk_flags", [])))
-        self.log(f"final decision: {'APPROVE' if draft.approved else 'REJECT'}")
-        return draft

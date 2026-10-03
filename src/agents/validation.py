@@ -1,84 +1,133 @@
 """ValidationAgent — verifies extracted data against the inventory DB.
 
-Checks: unknown items, quantity exceeding stock, zero-stock / fraudulent
-items, negative quantities, and stated-total vs computed-total mismatches.
-Includes a self-correction loop: when extraction confidence is low and the
-issues look like extraction artefacts, it asks ingestion for one more pass.
+Checks, in order:
+  * structural: missing vendor / items / total (missing data -> human review)
+  * per-SKU: quantities aggregated across lines, then checked against stock;
+    unknown items (exact match only), negative/zero quantities, zero stock
+  * financial: expected_total = subtotal + tax + shipping (each parsed or
+    computed from lines); unexplained mismatch beyond $1.00 is an error,
+    because overbilling is the most common invoice fraud.
+
+Self-correction is real here: item names get variant-aware lookup
+("WidgetA (rush order)" -> "WidgetA"), with a logged warning when a
+fallback variant is what matched — not a blind rerun of extraction.
 """
 from __future__ import annotations
 
-from typing import List
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple
 
 from .base import BaseAgent
 from ..models import Invoice, ValidationIssue, ValidationResult
 from ..tools import InventoryDB
+from .ingestion import IngestionAgent
+
+MISMATCH_TOLERANCE = 1.00
 
 
 class ValidationAgent(BaseAgent):
     name = "validation"
 
-    def __init__(self, db: InventoryDB):
+    def __init__(self, db: InventoryDB, tracer=None):
+        super().__init__(tracer)
         self.db = db
 
-    def _validate(self, inv: Invoice) -> ValidationResult:
+    def _lookup_with_variants(self, name: str):
+        """Exact inventory match, trying name variants. Returns (row, variant_used)."""
+        row = self.use_tool("inventory.lookup", {"item": name},
+                            lambda: self.db.lookup(name))
+        if row is not None:
+            return row, None
+        for variant in IngestionAgent._name_variants(name)[1:]:
+            row = self.use_tool("inventory.lookup", {"item": variant},
+                                lambda v=variant: self.db.lookup(v))
+            if row is not None:
+                return row, variant
+        return None, None
+
+    def run(self, inv: Invoice) -> Tuple[ValidationResult, Dict[str, float]]:
         issues: List[ValidationIssue] = []
 
+        # -- structural ---------------------------------------------------
         if not inv.vendor:
-            issues.append(ValidationIssue("missing_vendor", "error", "Vendor name could not be determined"))
+            issues.append(ValidationIssue("missing_vendor", "error",
+                                          "Vendor/payee could not be determined"))
         if not inv.items:
-            issues.append(ValidationIssue("missing_items", "error", "No line items extracted"))
+            issues.append(ValidationIssue("missing_items", "error",
+                                          "No line items extracted"))
         if inv.total_amount is None:
-            issues.append(ValidationIssue("missing_total", "warning", "Total amount missing; cannot cross-check"))
+            issues.append(ValidationIssue("missing_total", "error",
+                                          "No total amount — cannot verify what would be paid"))
 
+        # -- per-SKU aggregation -------------------------------------------
+        sku_qty: Dict[str, float] = defaultdict(float)
+        sku_rep: Dict[str, str] = {}
         for li in inv.items:
-            if li.quantity < 0:
+            key = InventoryDB.normalize(li.item)
+            sku_qty[key] += li.quantity
+            sku_rep.setdefault(key, li.item)
+
+        for key, qty in sku_qty.items():
+            rep = sku_rep[key]
+            if qty < 0:
                 issues.append(ValidationIssue("negative_quantity", "error",
-                                              f"Negative quantity {li.quantity} is a data-integrity issue",
-                                              item=li.item))
+                                              f"Negative net quantity {qty:g} is a data-integrity issue",
+                                              item=rep))
                 continue
-            row = self.db.lookup(li.item)
+            if qty == 0:
+                issues.append(ValidationIssue("zero_quantity", "error",
+                                              "Zero quantity — nothing to pay for",
+                                              item=rep))
+                continue
+            row, variant = self._lookup_with_variants(rep)
             if row is None:
                 issues.append(ValidationIssue("unknown_item", "error",
-                                              f"Item {li.item!r} not found in inventory database",
-                                              item=li.item))
+                                              f"Item {rep!r} not found in inventory database",
+                                              item=rep))
             elif row["stock"] <= 0:
                 issues.append(ValidationIssue("zero_stock", "error",
-                                              f"Item {li.item!r} has zero stock — possible fraudulent entry",
-                                              item=li.item))
-            elif li.quantity > row["stock"]:
+                                              f"Item {rep!r} has zero stock — possible fraudulent entry",
+                                              item=rep))
+            elif qty > row["stock"]:
                 issues.append(ValidationIssue(
                     "stock_mismatch", "error",
-                    f"Requested {li.quantity}x {li.item!r} but only {row['stock']} in stock",
-                    item=li.item))
+                    f"Requested {qty:g}x {rep!r} but only {row['stock']} in stock "
+                    f"(aggregated across lines)", item=rep))
+            elif variant is not None:
+                issues.append(ValidationIssue(
+                    "fuzzy_sku_match", "warning",
+                    f"Item {rep!r} matched inventory as {row['item']!r} after "
+                    f"normalization — verify the SKU", item=rep))
 
-        # Cross-check stated total against computed line total.
-        if inv.total_amount is not None and inv.items:
-            priced = [i for i in inv.items if i.unit_price]
-            if priced:
-                computed = sum(i.quantity * (i.unit_price or 0) for i in priced)
-                if abs(computed - inv.total_amount) > 1.0:
-                    issues.append(ValidationIssue(
-                        "total_mismatch", "warning",
-                        f"Stated total ${inv.total_amount:,.2f} != computed ${computed:,.2f}"))
+        # -- financial total model ----------------------------------------
+        totals = self._expected_totals(inv)
+        if inv.total_amount is not None and totals["expected"] is not None:
+            diff = abs(inv.total_amount - totals["expected"])
+            if diff > MISMATCH_TOLERANCE:
+                issues.append(ValidationIssue(
+                    "total_mismatch", "error",
+                    f"Stated total ${inv.total_amount:,.2f} != expected "
+                    f"${totals['expected']:,.2f} ({totals['basis']}); "
+                    f"unexplained difference ${diff:,.2f}"))
 
         passed = not any(i.severity == "error" for i in issues)
-        return ValidationResult(passed=passed, issues=issues)
+        self.log(f"{'PASS' if passed else 'FAIL'} ({len(issues)} issues)")
+        return ValidationResult(passed=passed, issues=issues), totals
 
-    def run(self, inv: Invoice, reextract=None) -> ValidationResult:
-        """reextract: optional callable returning a fresh Invoice for the correction loop."""
-        result = self._validate(inv)
-        self.log(f"initial check: {'PASS' if result.passed else 'FAIL'} "
-                 f"({len(result.issues)} issues)")
-
-        # Self-correction: low-confidence extraction + suspicious issues -> one more pass.
-        if (not result.passed and inv.extraction_confidence < 0.6 and reextract is not None
-                and any(i.code in {"missing_vendor", "missing_items", "unknown_item"}
-                        for i in result.issues)):
-            self.log("low extraction confidence — requesting one re-extraction")
-            inv2 = reextract()
-            result2 = self._validate(inv2)
-            self.log(f"re-check: {'PASS' if result2.passed else 'FAIL'}")
-            if result2.passed or len(result2.errors()) < len(result.errors()):
-                inv.items, inv.vendor = inv2.items, inv2.vendor or inv.vendor
-                return result2
-        return result
+    @staticmethod
+    def _expected_totals(inv: Invoice) -> Dict[str, Optional[float]]:
+        """expected = subtotal + tax + shipping, each parsed or computed."""
+        lines = [(li.quantity or 0) * (li.unit_price or 0) for li in inv.items]
+        line_sum = sum(lines) if all(li.unit_price for li in inv.items) and inv.items else None
+        subtotal = inv.subtotal if inv.subtotal is not None else line_sum
+        if subtotal is None:
+            return {"expected": None, "basis": "no basis"}
+        parts = [f"subtotal ${subtotal:,.2f}"]
+        expected = subtotal
+        if inv.tax_amount:
+            expected += inv.tax_amount
+            parts.append(f"tax ${inv.tax_amount:,.2f}")
+        if inv.shipping_amount:
+            expected += inv.shipping_amount
+            parts.append(f"shipping ${inv.shipping_amount:,.2f}")
+        return {"expected": round(expected, 2), "basis": " + ".join(parts)}

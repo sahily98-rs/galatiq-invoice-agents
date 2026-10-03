@@ -1,72 +1,110 @@
-# Invoice Processing Automation — Multi-Agent System
+# Invoice Processing Automation — Galatiq Technical Assessment
 
-Submission for the Galatiq technical assessment: a working multi-agent prototype that automates Acme Corp's end-to-end invoice workflow — ingestion → validation → approval → payment.
+A multi-agent system that automates the accounts-payable invoice pipeline:
+**ingest → validate → approve → pay**, with a reflection loop and a human-review
+escape hatch at every stage.
 
-Acme Corp (PE-backed manufacturing) loses **~$2M/year** to manual invoice processing: 30% error rates, 5-day delays, frustrated stakeholders. This system attacks exactly that: every invoice is extracted, validated against inventory, reviewed under policy, and either paid or rejected **with logged reasoning** — no human in the loop for the routine cases, and a clear audit trail for the exceptions.
+**Author:** Sahil · **Submission for:** Galatiq AI technical assessment
+
+## Quickstart
+
+```bash
+python -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+# Sample PDFs are binary and not committed; fetch the 3 originals:
+python data/fetch_pdfs.py
+
+python setup_inventory.py        # create the mock inventory DB
+python main.py --invoice_path=data/invoices/invoice_1001.txt
+python demo.py --report          # run all 20 samples + write report.html
+python -m pytest tests/ -q       # 26 tests, incl. a golden file
+```
+
+Set `XAI_API_KEY` to use Grok as the reasoning engine; without it the
+deterministic local engine runs everything offline.
 
 ## Architecture
 
-Four specialized agents, orchestrated as a pipeline (`src/orchestrator.py`):
+```
+                    ┌─────────────┐
+                    │ Orchestrator │  run_id, crash→HOLD, duplicate guard,
+                    └──────┬──────┘  structured JSONL log (runs.jsonl)
+                           │
+        ┌──────────────────┼──────────────────┐
+        ▼                  ▼                  ▼
+ ┌─────────────┐   ┌──────────────┐   ┌───────────────┐
+ │ Ingestion   │   │ Validation   │   │ Approval      │
+ │ Agent       │──▶│ Agent        │──▶│ Agent         │
+ └─────────────┘   └──────────────┘   └───────┬───────┘
+        │                                     │
+        │ repair pass (v2 algorithm)          │ critic (raw doc)
+        │ on missing fields                   │ can divert → HOLD
+        ▼                                     ▼
+ ┌─────────────┐                     ┌───────────────┐
+ │ structured  │                     │ Payment Agent │──▶ ledger.jsonl
+ │ parse / LLM │                     └───────────────┘  (invoice #, run_id,
+ └─────────────┘                                       outcome — always written)
+```
 
-| Agent | Tools | Job |
+**Outcomes** — `PAID`, `REJECTED_VALIDATION`, `REJECTED_FRAUD`,
+`REJECTED_DUPLICATE`, `HOLD_REVIEW`. Anything the system can't decide
+confidently (missing payee/total, low extraction confidence, foreign
+currency, vendor identity questions, crashes) goes to **HOLD_REVIEW** for a
+human instead of being auto-paid or crashing.
+
+**Agents and their tools** (every tool call is traced to `runs.jsonl`):
+
+| Agent | Tools | What it does |
 |---|---|---|
-| **IngestionAgent** | `read_document`, `parse_structured`, LLM extraction | Pulls Vendor, Amount, Items, Due Date from PDF/TXT/CSV/JSON/XML. Structured formats are parsed natively (fast, exact); free text goes through the LLM. **Self-correction:** one repair pass when critical fields are missing. |
-| **ValidationAgent** | `InventoryDB.lookup` (SQLite) | Flags unknown items, quantity > stock, zero-stock/fraudulent items, negative quantities, and stated-vs-computed total mismatches. **Self-correction:** requests re-extraction when confidence is low and issues look like extraction artefacts. |
-| **ApprovalAgent** | policy rules + `detect_fraud_signals` | Rule-based VP review: validation errors → reject; fraud language (urgency, wire-transfer pressure) → reject; >$10K → heightened scrutiny. **Reflection loop:** every draft decision is passed through a critic (LLM auditor, or a policy-grounded local critic) that can uphold or challenge it; challenged decisions are revised once. |
-| **PaymentAgent** | `mock_payment` | Executes payment on approval; otherwise logs the rejection **with reasoning** to `ledger.jsonl` — the audit trail finance actually needs. |
+| Ingestion | `read_document`, `parse_structured`, `llm.extract` | Native JSON/CSV/XML parse; free text via Grok or the local engine. If critical fields are missing, a *different* algorithm (line-oriented labeled scan + price-anchored item detection) runs as the repair pass. Dates normalized to ISO, currency detected, payee names sanitized against PDF column bleed. |
+| Validation | `inventory.lookup` | Exact SKU matching (no fuzzy substring). Quantities **aggregated per SKU** before stock checks. Expected total = subtotal + tax + shipping; unexplained mismatch > $1.00 is an error (overbilling is the classic invoice fraud). Missing total is an error → HOLD. |
+| Approval | `risk.analyze`, `llm.critique` | Policy: errors → reject; critical fraud signals (wire-transfer pressure, backdated due date) → reject as fraud; missing data / identity questions / FX / low confidence → hold. A critic with access to the **raw document** reviews the draft and can divert *either* direction to human review. |
+| Payment | `mock_payment` | Executes or withholds payment; **always** writes a ledger entry with invoice number + run ID. |
 
-**LLM integration** (`src/llm.py`): xAI's Grok is the reasoning engine when `XAI_API_KEY` is set. Without a key, a deterministic local engine takes over — tolerant regex extraction (handles typos like "Vndr", "INVOCE", OCR noise like "2O26"/"$3,500.O0") plus a policy-grounded critic — so the system runs fully offline, per the brief.
-
-## Setup
-
-```bash
-pip install -r requirements.txt
-python setup_inventory.py        # creates inventory.db (required)
-```
-
-## Running
-
-```bash
-# Single invoice (human-readable summary)
-python main.py --invoice_path=data/invoices/invoice_1001.txt
-
-# Full result as JSON
-python main.py --invoice_path=data/invoices/invoice_1002.txt --json
-
-# All 20 sample invoices, summary table
-python demo.py
-```
-
-With Grok as the reasoning engine:
-
-```bash
-export XAI_API_KEY=your_key_here
-python main.py --invoice_path=data/invoices/invoice_1003.txt
-```
-
-## What it does on the test set
-
-| Scenario | Example | Outcome |
-|---|---|---|
-| Clean invoice, in stock | INV-1001 | **PAID** |
-| Quantity exceeds stock | INV-1002 (20× GadgetX, 5 in stock) | Rejected — `stock_mismatch` |
-| Fraudulent vendor + urgency language | INV-1003 (FakeItem, "wire transfer preferred") | Rejected — `zero_stock` + fraud signals |
-| Unknown products | INV-1008 (SuperGizmo, MegaSprocket) | Rejected — `unknown_item` |
-| Data integrity (negative qty) | INV-1009 | Rejected — `negative_quantity` |
-| Messy OCR invoice | INV-1012 ("FROM:", "Widget A", "2O26") | **PAID** after tolerant extraction |
-| High-value but clean (>$10K) | INV-1013 ($22.5K) | **PAID** with scrutiny flag |
-
-Every run appends a structured record to `ledger.jsonl`: who, how much, approved/rejected, why.
-
-## Design decisions (and what I'd do with more time)
-
-- **Custom orchestration over a framework.** LangGraph/CrewAI would add weight without changing the demo; the agent boundaries, tool contracts, and correction loops are explicit and testable as plain Python.
-- **Deterministic fast path + LLM enhancement.** Native parsing for structured formats; LLM only where it adds value (messy text, critique). This is also why the system works with zero API keys.
-- **Rejections are first-class outputs.** A finance automation that silently drops invoices is worse than the manual process — hence the ledger with reasoning on every decision.
-- **Next steps:** confidence-scored human-in-the-loop queue for borderline cases, vendor master-data matching, and a small review UI over the ledger.
+**Self-correction that actually fires** (check `runs.jsonl` / console):
+- Ingestion repair pass uses a different algorithm when fields are missing.
+- Validation does variant-aware SKU lookup (`"WidgetA (rush order)"` → `WidgetA`) with a logged warning.
+- The critic catches garbled payees from two-column PDFs and weak rejections (unknown item close to a known SKU → human verifies instead of auto-reject).
+- The orchestrator converts *any* crash into `HOLD_REVIEW` + ledger entry — an invoice never vanishes from the audit trail.
+- Duplicate invoice numbers are refused before money moves (idempotency via the ledger).
 
 ## Business impact
 
-- **Error rate:** validation catches the exact failure modes behind Acme's 30% error rate (stock mismatches, unknown items, bad data) *before* money moves.
-- **Cycle time:** straight-through processing for clean invoices collapses the 5-day email-chain delay to seconds; only exceptions need humans.
-- **Fraud:** urgency/wire-transfer language and zero-stock vendors are flagged automatically instead of relying on a tired AP clerk to notice.
+- **Throughput:** 20 invoices processed end-to-end in seconds; clean ones paid automatically.
+- **Loss prevention:** per-SKU stock aggregation, duplicate-invoice refusal, overbilling detection (stated vs. computed totals), and wire-fraud pressure signals.
+- **Auditability:** every decision carries a run ID, reasoning, risk flags, and a ledger entry; structured JSONL logs capture each stage and tool call.
+- **Human leverage:** HOLD_REVIEW concentrates reviewer time on the ambiguous cases, instead of all-or-nothing automation.
+
+## Evaluation scenarios (all 20 samples, `tests/golden.json`)
+
+| Invoice | Outcome | Why |
+|---|---|---|
+| 1001, 1006, 1010, 1011.pdf, 1015 | **PAID** | Clean; totals verified against subtotal+tax+shipping |
+| 1002, 1005, 1007, 1008, 1013 | **REJECTED** | Stock over-request (aggregated per SKU), unknown SKUs |
+| 1003 | **REJECTED_FRAUD** | Wire-transfer pressure + backdated due date + zero-stock item |
+| 1004_revised, 1011.txt | **REJECTED_DUPLICATE** | Same invoice number already paid |
+| 1009, 1012, 1014, 1016 | **HOLD_REVIEW** | Missing payee; vendor name change (BEC pattern); EUR (no FX); unknown SKU close to a real one |
+
+Notable catches: 1015's total is $6,500 (not the $2,500 line total a naive CSV parse takes);
+1013's per-line quantities look fine but aggregate to 22/18/9 against stock of 15/10/5;
+1010's $7,185 total is *correct* once tax ($335) and shipping ($150) are modeled.
+
+## UI
+
+`python demo.py --report` writes `report.html` — a styled summary with outcome
+badges, amounts, and expandable per-invoice detail (issues, reasoning, risk flags).
+
+## LLM integration
+
+`src/llm.py` — Grok via `xai-sdk` (`XAI_API_KEY`), used for free-text extraction
+and the critic's second pass, with strict JSON parsing. **Failures are loud**:
+a broken key or SDK error is logged as an error and flagged (`degraded`), never
+silently treated as success. Without a key, the deterministic local engine runs
+the same interfaces offline.
+
+## Future improvements
+
+- FX conversion / multi-currency settlement instead of holding foreign invoices.
+- Human-review queue UI with approve/reject actions feeding back into the ledger.
+- Learned extraction confidence from reviewer corrections.
+- Vendor master-data matching (beyond the name-change signal) for BEC defense.

@@ -1,14 +1,18 @@
 """Tools used by the agents: document reading, structured parsing,
-inventory lookups, fraud-signal detection, and the mock payment API."""
+inventory lookups, risk-signal analysis, and the mock payment API."""
 from __future__ import annotations
 
 import csv
+import datetime
 import json
 import os
 import re
 import sqlite3
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Tuple
+
+from . import dates as dateparse
+from .models import RiskSignal
 
 
 # ---------------------------------------------------------------- document I/O
@@ -25,6 +29,21 @@ def read_document(path: str) -> str:
         return f.read()
 
 
+def _money(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        return float(str(v).replace(",", "").replace("$", "").replace("€", "").strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def _norm_key(k: str) -> str:
+    return re.sub(r"[\s_\-]+", "_", k.strip().lower())
+
+
+# ------------------------------------------------------- structured parsing
+
 def parse_structured(path: str) -> Optional[Dict[str, Any]]:
     """Natively parse JSON / CSV / XML invoices into a normalized dict.
 
@@ -34,25 +53,13 @@ def parse_structured(path: str) -> Optional[Dict[str, Any]]:
     ext = os.path.splitext(path)[1].lower()
     if ext == ".json":
         with open(path, encoding="utf-8") as f:
-            raw = json.load(f)
-        return _normalize_json(raw)
+            return _normalize_json(json.load(f))
     if ext == ".csv":
         with open(path, encoding="utf-8", newline="") as f:
-            rows = list(csv.DictReader(f))
-        return _normalize_rows(rows)
+            return _normalize_csv(list(csv.DictReader(f)))
     if ext == ".xml":
-        tree = ET.parse(path)
-        return _normalize_xml(tree.getroot())
+        return _normalize_xml(ET.parse(path).getroot())
     return None
-
-
-def _money(v: Any) -> Optional[float]:
-    if v is None:
-        return None
-    try:
-        return float(str(v).replace(",", "").replace("$", "").strip())
-    except (ValueError, TypeError):
-        return None
 
 
 def _normalize_json(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -63,99 +70,231 @@ def _normalize_json(raw: Dict[str, Any]) -> Dict[str, Any]:
     for li in raw.get("line_items", raw.get("items", [])):
         items.append({
             "item": str(li.get("item", li.get("name", ""))),
-            "quantity": int(li.get("quantity", 0)),
+            "quantity": _qty(li.get("quantity", 0)),
             "unit_price": _money(li.get("unit_price", li.get("price"))),
         })
     return {
-        "vendor": vendor or "",
+        "vendor": sanitize_vendor(vendor or ""),
         "invoice_number": str(raw.get("invoice_number", raw.get("invoice_id", ""))),
-        "due_date": raw.get("due_date"),
+        "invoice_date": _norm_date(raw.get("date")),
+        "due_date": _norm_date(raw.get("due_date")),
         "total_amount": _money(raw.get("total", raw.get("total_amount", raw.get("amount")))),
+        "subtotal": _money(raw.get("subtotal")),
+        "tax_amount": _money(raw.get("tax_amount", raw.get("tax"))),
+        "shipping_amount": _money(raw.get("shipping_amount", raw.get("shipping"))),
+        "currency": parse_currency(json.dumps(raw)) or "USD",
         "items": items,
         "_warnings": [],
         "_confidence": 0.95,
     }
 
 
-def _norm_key(k: str) -> str:
-    return re.sub(r"[\s_\-]+", "_", k.strip().lower())
+def _qty(v: Any) -> int:
+    """Parse a quantity strictly: non-numeric or malformed -> raise, so the
+    caller can route to human review instead of silently coercing to 0."""
+    if isinstance(v, bool):
+        raise ValueError(f"non-numeric quantity: {v!r}")
+    if isinstance(v, (int, float)):
+        if isinstance(v, float) and not v.is_integer():
+            raise ValueError(f"fractional quantity: {v!r}")
+        return int(v)
+    s = str(v).strip().replace(",", "")
+    if not re.fullmatch(r"-?\d+", s):
+        raise ValueError(f"non-numeric quantity: {v!r}")
+    return int(s)
 
 
-def _normalize_rows(rows: List[Dict[str, str]]) -> Dict[str, Any]:
-    # Detect vertical "field,value" layout (e.g. invoice_1006.csv) and transpose it.
-    if rows and {_norm_key(k) for k in rows[0].keys()} == {"field", "value"}:
-        kv = {_norm_key(r.get("field", "")): (r.get("value") or "") for r in rows}
-        rows = [kv]
+def _normalize_csv(rows: List[Dict[str, str]]) -> Dict[str, Any]:
+    rows = [{_norm_key(k): (v or "") for k, v in r.items()} for r in rows]
 
-    def pick(row: Dict[str, str], *names: str) -> str:
-        low = {_norm_key(k): v for k, v in row.items()}
-        for n in names:
-            if n in low:
-                return low[n] or ""
-        return ""
+    # Vertical "field,value" layout -> collect repeated item groups.
+    if rows and set(rows[0].keys()) == {"field", "value"}:
+        return _normalize_csv_vertical(rows)
+    return _normalize_csv_horizontal(rows)
 
-    items = []
-    for row in rows:
-        name = pick(row, "item", "product", "name")
+
+def _normalize_csv_vertical(rows: List[Dict[str, str]]) -> Dict[str, Any]:
+    header: Dict[str, str] = {}
+    items: List[Dict[str, Any]] = []
+    cur: Dict[str, Any] = {}
+    for r in rows:
+        k, v = r["field"], r["value"]
+        if k in ("item", "quantity", "unit_price", "price"):
+            cur[{"item": "item", "quantity": "quantity"}.get(k, "unit_price")] = v
+            if len(cur) == 3 or k in ("unit_price", "price"):
+                # flush on a complete triple; tolerant of missing price
+                if "item" in cur:
+                    items.append({
+                        "item": cur["item"],
+                        "quantity": _qty(cur.get("quantity", 0)),
+                        "unit_price": _money(cur.get("unit_price")),
+                    })
+                cur = {}
+        else:
+            header[k] = v
+    if cur and "item" in cur:  # trailing partial group
+        items.append({"item": cur["item"], "quantity": _qty(cur.get("quantity", 0)),
+                      "unit_price": _money(cur.get("unit_price"))})
+    return {
+        "vendor": sanitize_vendor(header.get("vendor", "")),
+        "invoice_number": header.get("invoice_number", header.get("invoice", "")),
+        "invoice_date": _norm_date(header.get("date")),
+        "due_date": _norm_date(header.get("due_date", header.get("due"))),
+        "total_amount": _money(header.get("total")),
+        "subtotal": _money(header.get("subtotal")),
+        "tax_amount": _money(header.get("tax")),
+        "shipping_amount": _money(header.get("shipping")),
+        "currency": "USD",
+        "items": items,
+        "_warnings": [],
+        "_confidence": 0.95,
+    }
+
+
+def _normalize_csv_horizontal(rows: List[Dict[str, str]]) -> Dict[str, Any]:
+    items: List[Dict[str, Any]] = []
+    subtotal = tax = shipping = total = None
+    first = rows[0] if rows else {}
+    for r in rows:
+        name = (r.get("item") or r.get("product") or r.get("name") or "").strip()
         if not name:
+            # footer rows: Subtotal: / Tax (6%): / Total:
+            label = " ".join(v for v in r.values() if v).lower()
+            if "subtotal" in label:
+                subtotal = _money(_last_money_cell(r))
+            elif "tax" in label:
+                tax = _money(_last_money_cell(r))
+            elif re.search(r"(^|[\s,])total\s*:", label):
+                total = _money(_last_money_cell(r))
             continue
-        qty_raw = pick(row, "quantity", "qty")
-        try:
-            qty = int(float(qty_raw)) if qty_raw else 0
-        except ValueError:
-            qty = 0
         items.append({
             "item": name,
-            "quantity": qty,
-            "unit_price": _money(pick(row, "unit_price", "price")),
+            "quantity": _qty(r.get("quantity", r.get("qty", 0))),
+            "unit_price": _money(r.get("unit_price", r.get("price"))),
         })
-    first = rows[0] if rows else {}
-    total = _money(pick(first, "total", "total_amount", "amount", "line_total"))
+    # Never mistake a per-line total for the invoice total.
     computed = sum((i["quantity"] or 0) * (i["unit_price"] or 0) for i in items)
     return {
-        "vendor": pick(first, "vendor", "vendor_name"),
-        "invoice_number": pick(first, "invoice_number", "invoice", "inv", "inv_no"),
-        "due_date": pick(first, "due_date", "due") or None,
+        "vendor": sanitize_vendor(first.get("vendor", first.get("vendor_name", ""))),
+        "invoice_number": first.get("invoice_number", first.get("invoice", "")),
+        "invoice_date": _norm_date(first.get("date")),
+        "due_date": _norm_date(first.get("due_date", first.get("due"))),
         "total_amount": total if total else (computed or None),
+        "subtotal": subtotal,
+        "tax_amount": tax,
+        "shipping_amount": shipping,
+        "currency": "USD",
         "items": items,
         "_warnings": [],
         "_confidence": 0.95,
     }
+
+
+def _last_money_cell(row: Dict[str, str]) -> str:
+    for v in reversed(list(row.values())):
+        if v and re.search(r"\d", v):
+            return v
+    return ""
 
 
 def _normalize_xml(root: ET.Element) -> Dict[str, Any]:
-    def text(tag: str) -> str:
-        el = root.find(f".//{tag}")
-        return (el.text or "").strip() if el is not None and el.text else ""
+    def text(*tags: str) -> str:
+        for tag in tags:
+            el = root.find(f".//{tag}")
+            if el is not None and el.text and el.text.strip():
+                return el.text.strip()
+        return ""
 
     items = []
     for li in root.findall(".//line_item") + root.findall(".//item"):
         name_el = li.find("name")
-        name = (name_el.text or "").strip() if name_el is not None and name_el.text else (li.get("name") or "")
+        name = ((name_el.text or "").strip() if name_el is not None else "") or (li.get("name") or "")
         if not name:
             continue
         qty_el = li.find("quantity")
         price_el = li.find("unit_price")
         items.append({
             "item": name,
-            "quantity": int(float((qty_el.text or "0") if qty_el is not None else li.get("quantity", 0))),
+            "quantity": _qty(qty_el.text if qty_el is not None else li.get("quantity", 0)),
             "unit_price": _money(price_el.text if price_el is not None else li.get("unit_price")),
         })
+    curr = text("currency") or "USD"
     return {
-        "vendor": text("vendor") or text("vendor_name"),
-        "invoice_number": text("invoice_number") or text("invoice_id"),
-        "due_date": text("due_date") or None,
-        "total_amount": _money(text("total") or text("total_amount")),
+        "vendor": sanitize_vendor(text("vendor", "vendor_name")),
+        "invoice_number": text("invoice_number", "invoice_id"),
+        "invoice_date": _norm_date(text("date")),
+        "due_date": _norm_date(text("due_date")),
+        "total_amount": _money(text("total", "total_amount")),
+        "subtotal": _money(text("subtotal")),
+        "tax_amount": _money(text("tax_amount", "tax")),
+        "shipping_amount": _money(text("shipping_amount", "shipping")),
+        "currency": curr if len(curr) == 3 else "USD",
         "items": items,
         "_warnings": [],
         "_confidence": 0.95,
     }
 
 
+def _norm_date(v: Any) -> Optional[str]:
+    if not v:
+        return None
+    d = dateparse.parse_date(str(v))
+    return dateparse.iso(d)
+
+
+# ------------------------------------------------------------------ vendors
+
+# Trailing fragments leaked in from two-column PDF layouts, e.g.
+# "Atlas Industrial Supply Due: 2026-03-24".
+_VENDOR_TRAILING_JUNK = re.compile(
+    r"\s*(due|date|invoice)\s*:?\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}\s*$", re.IGNORECASE)
+
+
+def sanitize_vendor(vendor: str) -> str:
+    """Strip date-like fragments that leak into payee names from multi-column
+    PDF extraction. Returns "" if nothing sane remains."""
+    v = (vendor or "").strip()
+    v = _VENDOR_TRAILING_JUNK.sub("", v).strip(" ,;:")
+    # A payee that still contains a date fragment is garbled, not a name.
+    if re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", v):
+        return ""
+    if len(v) < 2:
+        return ""
+    return v
+
+
+# ------------------------------------------------------------------ currency
+
+_CURRENCY_RE = re.compile(r"\b(USD|EUR|GBP|JPY|CAD|AUD|CHF)\b", re.IGNORECASE)
+
+
+def parse_currency(text: str) -> Optional[str]:
+    """Find an explicit ISO currency code; None if the document is silent."""
+    if not text:
+        return None
+    if "€" in text:
+        return "EUR"
+    if "£" in text:
+        return "GBP"
+    m = _CURRENCY_RE.search(text)
+    return m.group(1).upper() if m else None
+
+
 # ------------------------------------------------------------------ inventory
 
 class InventoryDB:
-    """SQLite-backed mock inventory database for the validation agent."""
+    """SQLite-backed mock inventory database.
+
+    Matching is exact (after normalization) plus an explicit alias table.
+    Fuzzy substring matching is deliberately NOT used: paying the wrong SKU
+    because "A" matched "WidgetA" is worse than asking a human.
+    """
+
+    ALIASES = {
+        "widget a": "WidgetA",
+        "widget b": "WidgetB",
+        "gadget x": "GadgetX",
+    }
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -165,22 +304,32 @@ class InventoryDB:
     def close(self) -> None:
         self.conn.close()
 
+    def skus(self) -> List[str]:
+        cur = self.conn.execute("SELECT item FROM inventory")
+        return [r[0] for r in cur.fetchall()]
+
+    @staticmethod
+    def normalize(name: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", name.lower())
+
     def lookup(self, item_name: str) -> Optional[sqlite3.Row]:
-        cur = self.conn.execute(
-            "SELECT item, stock FROM inventory WHERE lower(item) = lower(?)", (item_name,))
-        row = cur.fetchone()
-        if row:
-            return row
-        # tolerant fallback: substring match either direction
+        norm = self.normalize(item_name)
+        if not norm:
+            return None
         cur = self.conn.execute("SELECT item, stock FROM inventory")
-        for r in cur.fetchall():
-            a, b = r["item"].lower(), item_name.lower()
-            if a in b or b in a:
-                return r
+        for row in cur.fetchall():
+            if self.normalize(row["item"]) == norm:
+                return row
+        alias = self.ALIASES.get(item_name.strip().lower())
+        if alias:
+            cur = self.conn.execute(
+                "SELECT item, stock FROM inventory WHERE item = ?", (alias,))
+            return cur.fetchone()
         return None
 
 
-def create_inventory_db(db_path: str, seed: Optional[List[Tuple[str, int]]] = None) -> str:
+def create_inventory_db(db_path: str,
+                        seed: Optional[List[Tuple[str, int]]] = None) -> str:
     """Create the mock inventory database with starter seed data."""
     seed = seed or [("WidgetA", 15), ("WidgetB", 10), ("GadgetX", 5), ("FakeItem", 0)]
     if os.path.exists(db_path):
@@ -194,21 +343,71 @@ def create_inventory_db(db_path: str, seed: Optional[List[Tuple[str, int]]] = No
     return db_path
 
 
-# ------------------------------------------------------------- fraud signals
+# ------------------------------------------------------------- risk signals
 
-FRAUD_KEYWORDS = [
-    "urgent", "immediately", "wire transfer", "penalty", "penalties",
-    "asap", "do not delay", "confidential", "secret payment",
-]
+def _word_re(*words: str) -> re.Pattern:
+    return re.compile(r"\b(?:" + "|".join(words) + r")\b", re.IGNORECASE)
 
-def detect_fraud_signals(raw_text: str) -> List[str]:
-    lowered = raw_text.lower()
-    return sorted({kw for kw in FRAUD_KEYWORDS if kw in lowered})
+
+_URGENCY = _word_re("urgent", "immediately", "asap", "right away")
+_WIRE = _word_re("wire transfer", "wire")
+_PENALTY = _word_re("penalt(?:y|ies)")
+
+
+def analyze_risk(raw_text: str, invoice_date: Optional[str],
+                 due_date: Optional[str]) -> List[RiskSignal]:
+    """Structured risk analysis. Word-boundary matching (not bare substring)
+    plus date-based and vendor-based signals the old detector missed."""
+    signals: List[RiskSignal] = []
+    text = raw_text or ""
+
+    urgency = bool(_URGENCY.search(text))
+    wire = bool(_WIRE.search(text))
+    penalty = bool(_PENALTY.search(text))
+
+    if wire and urgency:
+        signals.append(RiskSignal("wire_transfer_pressure", "critical",
+                                  "Wire-transfer request combined with urgency language"))
+    elif wire:
+        signals.append(RiskSignal("wire_transfer_request", "suspicious",
+                                  "Wire transfer requested without urgency markers"))
+    if urgency and not wire:
+        signals.append(RiskSignal("urgency_language", "suspicious",
+                                  "Urgency language in invoice text"))
+    # "penalty" alone is normal contract language; it matters with pressure.
+    if penalty and (urgency or wire):
+        signals.append(RiskSignal("penalty_threat", "suspicious",
+                                  "Penalty threat combined with payment pressure"))
+
+    inv_d = dateparse.parse_date(invoice_date) if invoice_date else None
+    due_d = dateparse.parse_date(due_date, ref=inv_d) if due_date else None
+    if inv_d and due_d:
+        if due_d < inv_d:
+            signals.append(RiskSignal("due_before_invoice", "critical",
+                                      f"Due {due_d.isoformat()} is before invoice date "
+                                      f"{inv_d.isoformat()}"))
+        elif due_d == inv_d:
+            signals.append(RiskSignal("due_equals_invoice_date", "suspicious",
+                                      "Due date equals invoice date — no payment terms"))
+    elif due_date and due_date.strip().lower() == "yesterday" and inv_d:
+        signals.append(RiskSignal("due_date_yesterday", "critical",
+                                  "Invoice is already overdue on arrival"))
+
+    if re.search(r"\(formerly\b", text, re.IGNORECASE):
+        signals.append(RiskSignal("vendor_name_change", "suspicious",
+                                  "Vendor notes a former name — verify identity "
+                                  "(business-email-compromise pattern)"))
+
+    return signals
 
 
 # ------------------------------------------------------------------- payment
 
-def mock_payment(vendor: str, amount: Optional[float]) -> Dict[str, Any]:
+def mock_payment(vendor: str, amount: Optional[float],
+                 currency: str = "USD") -> Dict[str, Any]:
     """Mock payment API, as specified in the challenge."""
-    print(f"Paid {amount} to {vendor}")
-    return {"status": "success"}
+    if amount is None:
+        raise ValueError("cannot pay an invoice with no total amount")
+    symbol = {"USD": "$", "EUR": "€", "GBP": "£"}.get(currency, "")
+    print(f"Paid {symbol}{amount:,.2f} {currency} to {vendor}")
+    return {"status": "success", "currency": currency}

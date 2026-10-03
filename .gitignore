@@ -1,4 +1,8 @@
+.venv/
 *.db
 *.jsonl
 __pycache__/
 *.pyc
+# Binary sample PDFs are not committed (see data/fetch_pdfs.py).
+data/invoices/*.pdf
+report.html
