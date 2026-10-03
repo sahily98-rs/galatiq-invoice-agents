@@ -73,16 +73,19 @@ def _normalize_json(raw: Dict[str, Any]) -> Dict[str, Any]:
             "quantity": _qty(li.get("quantity", 0)),
             "unit_price": _money(li.get("unit_price", li.get("price"))),
         })
+    curr_raw = json.dumps(raw)
     return {
         "vendor": sanitize_vendor(vendor or ""),
         "invoice_number": str(raw.get("invoice_number", raw.get("invoice_id", ""))),
+        "revision": str(raw.get("revision", raw.get("rev", "") or "")).strip() or None,
         "invoice_date": _norm_date(raw.get("date")),
         "due_date": _norm_date(raw.get("due_date")),
         "total_amount": _money(raw.get("total", raw.get("total_amount", raw.get("amount")))),
         "subtotal": _money(raw.get("subtotal")),
         "tax_amount": _money(raw.get("tax_amount", raw.get("tax"))),
         "shipping_amount": _money(raw.get("shipping_amount", raw.get("shipping"))),
-        "currency": parse_currency(json.dumps(raw)) or "USD",
+        "currency": parse_currency(curr_raw) or "USD",
+        "currency_explicit": parse_currency(curr_raw) is not None,
         "items": items,
         "_warnings": [],
         "_confidence": 0.95,
@@ -285,16 +288,10 @@ def parse_currency(text: str) -> Optional[str]:
 class InventoryDB:
     """SQLite-backed mock inventory database.
 
-    Matching is exact (after normalization) plus an explicit alias table.
-    Fuzzy substring matching is deliberately NOT used: paying the wrong SKU
-    because "A" matched "WidgetA" is worse than asking a human.
+    Matching is exact (after normalization: case/space/punctuation
+    insensitive). Fuzzy substring matching is deliberately NOT used: paying
+    the wrong SKU because "A" matched "WidgetA" is worse than asking a human.
     """
-
-    ALIASES = {
-        "widget a": "WidgetA",
-        "widget b": "WidgetB",
-        "gadget x": "GadgetX",
-    }
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -308,6 +305,12 @@ class InventoryDB:
         cur = self.conn.execute("SELECT item FROM inventory")
         return [r[0] for r in cur.fetchall()]
 
+    def list_price(self, item: str) -> Optional[float]:
+        cur = self.conn.execute("SELECT list_price FROM inventory WHERE item = ?",
+                                (item,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
     @staticmethod
     def normalize(name: str) -> str:
         return re.sub(r"[^a-z0-9]", "", name.lower())
@@ -316,28 +319,24 @@ class InventoryDB:
         norm = self.normalize(item_name)
         if not norm:
             return None
-        cur = self.conn.execute("SELECT item, stock FROM inventory")
+        cur = self.conn.execute("SELECT item, stock, list_price FROM inventory")
         for row in cur.fetchall():
             if self.normalize(row["item"]) == norm:
                 return row
-        alias = self.ALIASES.get(item_name.strip().lower())
-        if alias:
-            cur = self.conn.execute(
-                "SELECT item, stock FROM inventory WHERE item = ?", (alias,))
-            return cur.fetchone()
         return None
 
 
 def create_inventory_db(db_path: str,
-                        seed: Optional[List[Tuple[str, int]]] = None) -> str:
+                        seed: Optional[List[Tuple[str, int, float]]] = None) -> str:
     """Create the mock inventory database with starter seed data."""
-    seed = seed or [("WidgetA", 15), ("WidgetB", 10), ("GadgetX", 5), ("FakeItem", 0)]
+    seed = seed or [("WidgetA", 15, 250.0), ("WidgetB", 10, 500.0),
+                    ("GadgetX", 5, 750.0), ("FakeItem", 0, 0.0)]
     if os.path.exists(db_path):
         os.remove(db_path)
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    cur.execute("CREATE TABLE inventory (item TEXT PRIMARY KEY, stock INTEGER)")
-    cur.executemany("INSERT INTO inventory VALUES (?, ?)", seed)
+    cur.execute("CREATE TABLE inventory (item TEXT PRIMARY KEY, stock INTEGER, list_price REAL)")
+    cur.executemany("INSERT INTO inventory VALUES (?, ?, ?)", seed)
     conn.commit()
     conn.close()
     return db_path
@@ -352,12 +351,22 @@ def _word_re(*words: str) -> re.Pattern:
 _URGENCY = _word_re("urgent", "immediately", "asap", "right away")
 _WIRE = _word_re("wire transfer", "wire")
 _PENALTY = _word_re("penalt(?:y|ies)")
+# Business-email-compromise patterns: a vendor changing where money goes is
+# one of the highest-risk events in AP. These are general phrases, not
+# sample-specific strings.
+_BANK_CHANGE = re.compile(
+    r"(?i)\b(bank details? (have |has )?(changed|updated)|new (bank )?account|"
+    r"remit .* new account|updated? (bank|remittance) (details|info)|"
+    r"change of account|our .* account has changed)\b")
+_VENDOR_IDENTITY = re.compile(
+    r"(?i)\b(formerly|previously|now known as|\bfka\b)")
+_VAGUE_DUE = _word_re("upon receipt", "asap", "immediately")
 
 
 def analyze_risk(raw_text: str, invoice_date: Optional[str],
                  due_date: Optional[str]) -> List[RiskSignal]:
     """Structured risk analysis. Word-boundary matching (not bare substring)
-    plus date-based and vendor-based signals the old detector missed."""
+    plus date-based and vendor-based signals."""
     signals: List[RiskSignal] = []
     text = raw_text or ""
 
@@ -379,6 +388,13 @@ def analyze_risk(raw_text: str, invoice_date: Optional[str],
         signals.append(RiskSignal("penalty_threat", "suspicious",
                                   "Penalty threat combined with payment pressure"))
 
+    # Bank-detail changes are the classic business-email-compromise move.
+    m = _BANK_CHANGE.search(text)
+    if m:
+        signals.append(RiskSignal(
+            "bank_details_changed", "critical",
+            f"Remittance/bank details changed: {m.group(0)!r} — verify out of band"))
+
     inv_d = dateparse.parse_date(invoice_date) if invoice_date else None
     due_d = dateparse.parse_date(due_date, ref=inv_d) if due_date else None
     if inv_d and due_d:
@@ -386,16 +402,17 @@ def analyze_risk(raw_text: str, invoice_date: Optional[str],
             signals.append(RiskSignal("due_before_invoice", "critical",
                                       f"Due {due_d.isoformat()} is before invoice date "
                                       f"{inv_d.isoformat()}"))
-        elif due_d == inv_d:
-            signals.append(RiskSignal("due_equals_invoice_date", "suspicious",
-                                      "Due date equals invoice date — no payment terms"))
-    elif due_date and due_date.strip().lower() == "yesterday" and inv_d:
-        signals.append(RiskSignal("due_date_yesterday", "critical",
-                                  "Invoice is already overdue on arrival"))
+        elif (due_d - inv_d).days <= 1:
+            signals.append(RiskSignal("due_date_pressure", "suspicious",
+                                      "Due within a day of the invoice date — "
+                                      "no real payment terms"))
+    elif due_date and _VAGUE_DUE.search(due_date):
+        signals.append(RiskSignal("vague_due_date", "suspicious",
+                                  f"Due date is vague ({due_date!r}), not a real date"))
 
-    if re.search(r"\(formerly\b", text, re.IGNORECASE):
+    if _VENDOR_IDENTITY.search(text):
         signals.append(RiskSignal("vendor_name_change", "suspicious",
-                                  "Vendor notes a former name — verify identity "
+                                  "Vendor notes a former/changed name — verify identity "
                                   "(business-email-compromise pattern)"))
 
     return signals

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Run the pipeline over every sample invoice and print a summary table.
 
-The ledger is reset at the start so duplicate-invoice detection starts from
-a clean slate on every demo run (in production the ledger persists as the
-idempotency record).
+The demo writes to its OWN ledger (demo_ledger.jsonl) so it never touches
+or deletes the production audit trail (ledger.jsonl) — and so the brief's
+own example command still works afterwards.
 
     python demo.py [--report] [--quiet]
 """
@@ -26,12 +26,14 @@ def main() -> None:
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
-    for f in ("ledger.jsonl", "runs.jsonl"):
+    for f in ("demo_ledger.jsonl", "demo_runs.jsonl"):
         if os.path.exists(f):
             os.remove(f)
 
     paths = sorted(glob.glob("data/invoices/*"))
-    pipeline = InvoicePipeline(quiet=args.quiet)
+    pipeline = InvoicePipeline(ledger_path="demo_ledger.jsonl",
+                               log_path="demo_runs.jsonl",
+                               quiet=args.quiet)
     results = []
     try:
         for p in paths:
