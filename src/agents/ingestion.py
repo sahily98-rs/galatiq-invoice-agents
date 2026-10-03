@@ -37,10 +37,11 @@ class IngestionAgent(BaseAgent):
         inv_date = self._norm_date(data.get("invoice_date"))
         due_raw = data.get("due_date")
         due_norm = self._norm_date(due_raw, ref=inv_date)
-        currency = (data.get("currency") or parse_currency(raw_text) or "USD").upper()
+        stated_currency = data.get("currency") or parse_currency(raw_text)
         return Invoice(
             vendor=sanitize_vendor(str(data.get("vendor") or "")),
             invoice_number=str(data.get("invoice_number") or "").strip(),
+            revision=(str(data.get("revision") or "").strip() or None),
             invoice_date=inv_date,
             due_date=due_norm,
             due_date_raw=str(due_raw) if due_raw else None,
@@ -49,7 +50,8 @@ class IngestionAgent(BaseAgent):
             subtotal=data.get("subtotal"),
             tax_amount=data.get("tax_amount"),
             shipping_amount=data.get("shipping_amount"),
-            currency=currency,
+            currency=(stated_currency or "USD").upper(),
+            currency_explicit=stated_currency is not None,
             raw_text=raw_text,
             source_file=source,
             extraction_confidence=float(data.get("_confidence", 0.8)),

@@ -49,16 +49,18 @@ deterministic local engine runs everything offline.
 **Outcomes** — `PAID`, `REJECTED_VALIDATION`, `REJECTED_FRAUD`,
 `REJECTED_DUPLICATE`, `HOLD_REVIEW`. Anything the system can't decide
 confidently (missing payee/total, low extraction confidence, foreign
-currency, vendor identity questions, crashes) goes to **HOLD_REVIEW** for a
-human instead of being auto-paid or crashing.
+currency, vendor identity questions, amounts above the auto-pay ceiling,
+crashes) goes to **HOLD_REVIEW** for a human instead of being auto-paid or
+crashing. Outcomes are structured fields set by the approval agent — never
+inferred from reason text.
 
 **Agents and their tools** (every tool call is traced to `runs.jsonl`):
 
 | Agent | Tools | What it does |
 |---|---|---|
 | Ingestion | `read_document`, `parse_structured`, `llm.extract` | Native JSON/CSV/XML parse; free text via Grok or the local engine. If critical fields are missing, a *different* algorithm (line-oriented labeled scan + price-anchored item detection) runs as the repair pass. Dates normalized to ISO, currency detected, payee names sanitized against PDF column bleed. |
-| Validation | `inventory.lookup` | Exact SKU matching (no fuzzy substring). Quantities **aggregated per SKU** before stock checks. Expected total = subtotal + tax + shipping; unexplained mismatch > $1.00 is an error (overbilling is the classic invoice fraud). Missing total is an error → HOLD. |
-| Approval | `risk.analyze`, `llm.critique` | Policy: errors → reject; critical fraud signals (wire-transfer pressure, backdated due date) → reject as fraud; missing data / identity questions / FX / low confidence → hold. A critic with access to the **raw document** reviews the draft and can divert *either* direction to human review. |
+| Validation | `inventory.lookup` | Exact SKU matching (no fuzzy substring). Every line is resolved to its canonical SKU **first**, then quantities are **aggregated per SKU** before stock checks. Negative line quantities are always errors. Unit prices beyond 3x (or under 1/3x) the list price are errors. The line-item sum is **always** checked against the stated subtotal (a vendor who inflates both together does not pass); then expected = subtotal + tax + shipping is checked against the total. Unexplained mismatch > $1.00 is an error. Missing total is an error → HOLD. |
+| Approval | `risk.analyze`, `llm.critique` | Policy: critical fraud signals (wire-transfer pressure, bank-detail changes, backdated due date) → reject as fraud; errors → reject; missing data / identity questions / FX / low confidence / >$50K auto-pay ceiling → hold. A critic with access to the **raw document** reviews the draft and can divert *either* direction to human review. In Grok mode the critic runs a ReAct loop — Grok itself chooses between `inventory_lookup`, `ledger_search`, and `risk_analyze`, and its reasoning trace is recorded in `runs.jsonl`. |
 | Payment | `mock_payment` | Executes or withholds payment; **always** writes a ledger entry with invoice number + run ID. |
 
 **Self-correction that actually fires** (check `runs.jsonl` / console):
@@ -66,7 +68,19 @@ human instead of being auto-paid or crashing.
 - Validation does variant-aware SKU lookup (`"WidgetA (rush order)"` → `WidgetA`) with a logged warning.
 - The critic catches garbled payees from two-column PDFs and weak rejections (unknown item close to a known SKU → human verifies instead of auto-reject).
 - The orchestrator converts *any* crash into `HOLD_REVIEW` + ledger entry — an invoice never vanishes from the audit trail.
-- Duplicate invoice numbers are refused before money moves (idempotency via the ledger).
+- Duplicate invoices are keyed on **(vendor, invoice number)** — never pay the same vendor twice for one number. A *revised* invoice (new revision marker) is held with the difference calculated instead of rejected.
+
+## Human review queue
+
+Held invoices need a person. `python review.py --list` shows open holds;
+`python review.py --approve INV-1014 --note "..."` / `--reject ...` records
+the decision back into the ledger. `demo.py --report` generates `report.html`
+with a dollar summary ($X paid, $Y blocked, $Z overbilling caught, $W held)
+and the exact review commands for each held invoice.
+
+The demo writes to its own `demo_ledger.jsonl` — it never touches the
+production `ledger.jsonl`, so the brief's example commands keep working
+after a demo run.
 
 ## Business impact
 
@@ -82,7 +96,8 @@ human instead of being auto-paid or crashing.
 | 1001, 1006, 1010, 1011.pdf, 1015 | **PAID** | Clean; totals verified against subtotal+tax+shipping |
 | 1002, 1005, 1007, 1008, 1013 | **REJECTED** | Stock over-request (aggregated per SKU), unknown SKUs |
 | 1003 | **REJECTED_FRAUD** | Wire-transfer pressure + backdated due date + zero-stock item |
-| 1004_revised, 1011.txt | **REJECTED_DUPLICATE** | Same invoice number already paid |
+| 1004_revised | **HOLD_REVIEW** | Revision R1 of an already-paid invoice — held with the $4,050 difference calculated |
+| 1011.txt | **REJECTED_DUPLICATE** | Same (vendor, number) already paid |
 | 1009, 1012, 1014, 1016 | **HOLD_REVIEW** | Missing payee; vendor name change (BEC pattern); EUR (no FX); unknown SKU close to a real one |
 
 Notable catches: 1015's total is $6,500 (not the $2,500 line total a naive CSV parse takes);
@@ -91,8 +106,19 @@ Notable catches: 1015's total is $6,500 (not the $2,500 line total a naive CSV p
 
 ## UI
 
-`python demo.py --report` writes `report.html` — a styled summary with outcome
-badges, amounts, and expandable per-invoice detail (issues, reasoning, risk flags).
+`python demo.py --report` writes `report.html` — a styled run report with a
+dollar summary ($X paid, $Y blocked, $Z overbilling caught, $W held),
+outcome badges, and expandable per-invoice detail. Held invoices show the
+exact `review.py` commands to approve or reject them, closing the loop on
+the UI/UX criterion.
+
+## Red-teaming
+
+`tests/test_redteam.py` contains invoices designed to cheat the pipeline:
+inflated subtotals, variant-name stock evasion, absurd unit prices, negative
+lines netting overstock, vendor/number duplicate edge cases, and a
+bank-detail-change BEC attempt. Each is an attack with the expected outcome
+asserted.
 
 ## LLM integration
 

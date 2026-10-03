@@ -28,6 +28,8 @@ class Invoice:
     tax_amount: Optional[float] = None
     shipping_amount: Optional[float] = None
     currency: str = "USD"
+    currency_explicit: bool = False     # True if the document stated it
+    revision: Optional[str] = None      # e.g. "R1" for revised invoices
     raw_text: str = ""
     source_file: str = ""
     extraction_confidence: float = 1.0
@@ -46,6 +48,8 @@ class Invoice:
             "tax_amount": self.tax_amount,
             "shipping_amount": self.shipping_amount,
             "currency": self.currency,
+            "currency_explicit": self.currency_explicit,
+            "revision": self.revision,
             "extraction_confidence": self.extraction_confidence,
             "extraction_warnings": self.extraction_warnings,
             "extraction_strategy": self.extraction_strategy,
@@ -88,9 +92,12 @@ class RiskSignal:
 @dataclass
 class ApprovalDecision:
     """approved=True  -> pay. approved=False -> do not pay.
-    held=True         -> route to human review instead of auto-deciding."""
+    held=True         -> route to human review instead of auto-deciding.
+    decision_type is the structured outcome, set when the decision is made —
+    never inferred from reason text afterwards."""
     approved: bool
     held: bool = False
+    decision_type: str = "approve"  # approve | reject | reject_fraud | hold
     reasoning: str = ""
     critique_notes: str = ""
     risk_flags: List[str] = field(default_factory=list)
@@ -99,6 +106,7 @@ class ApprovalDecision:
         return {
             "approved": self.approved,
             "held": self.held,
+            "decision_type": self.decision_type,
             "reasoning": self.reasoning,
             "critique_notes": self.critique_notes,
             "risk_flags": self.risk_flags,
