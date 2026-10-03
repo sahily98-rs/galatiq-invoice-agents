@@ -61,6 +61,7 @@ class PaymentAgent(BaseAgent):
         self._record({
             "run_id": run_id,
             "invoice_number": inv.invoice_number,
+            "revision": inv.revision,
             "source_file": os.path.basename(inv.source_file),
             "vendor": inv.vendor,
             "amount": inv.total_amount,

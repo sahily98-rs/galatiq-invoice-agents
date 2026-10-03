@@ -48,6 +48,31 @@ Structured extraction: {invoice_json}
 Validation: {validation_json}
 Proposed decision: {decision_json}"""
 
+CRITIC_REACT_PROMPT = """You are a finance auditor reviewing an invoice-processing decision.
+You can call tools to gather evidence before deciding. Reply with ONLY one JSON
+object per turn, either a tool call or a final verdict:
+
+Tool call: {{"thought": "why I need this", "tool": "<name>", "args": {{...}}}}
+Verdict:   {{"thought": "summary", "verdict": "uphold" or "hold", "notes": "..."}}
+
+Choose "hold" if anything looks off: garbled payee names, amount anomalies,
+weak evidence, or missing data. Otherwise "uphold".
+
+Available tools:
+- inventory_lookup(item: string): SKU existence, stock on hand, list price
+- ledger_search(invoice_number: string, vendor: string): prior ledger entries
+- risk_analyze(): re-run the risk-signal analysis on the raw document
+
+Raw document (truncated):
+---
+{raw_text}
+---
+
+Structured extraction: {invoice_json}
+Validation: {validation_json}
+Proposed decision: {decision_json}
+{history}"""
+
 
 class LocalEngine:
     """Deterministic local extraction + critique. No network needed."""
@@ -63,9 +88,13 @@ class LocalEngine:
     DUE_RE = re.compile(r"(?im)^\s*(?:due date|due dt|due)\s*:\s*(.+?)\s*$")
     DATE_RE = re.compile(r"(?im)^\s*date\s*:\s*(.+?)\s*$")
     INVNO_RES = [
-        # Require a ":" or "#" (or "#:") between label and number, so
-        # "Invoice\nInvoice" can never match across a line break.
-        re.compile(r"(?im)(?:invoice\s*(?:number|no)?|inv\.?)\s*(?:#\s*:|:|#)\s*([A-Za-z0-9][A-Za-z0-9\-]*)"),
+        # Label ("invoice"/"inv", optional "no"/"number"), then "#" and/or ":",
+        # then the number. The gap may not cross a newline without a separator,
+        # so "Invoice\nInvoice: INV-1013" can't false-match. The number allows
+        # hyphens and a single space before trailing digits ("INV 1012").
+        re.compile(r"(?im)(?:invoice|inv)\b[ \t]*(?:no\.?|number)?[ \t]*"
+                   r"(?:#[ \t]*:?|:[ \t]*#?)[ \t]*"
+                   r"([A-Za-z0-9]+(?:-[A-Za-z0-9]+)*(?: [0-9]+)?)"),
     ]
     ITEM_RES = [
         # "WidgetA    qty: 10    unit price: $250.00" / "GadgetX  qty 20   @ $750 ea"
@@ -326,8 +355,11 @@ class LLMClient:
             try:
                 from xai_sdk import Client
                 self._client = Client(api_key=self.api_key, timeout=60)
-                # Validate the call signature eagerly so a broken integration
-                # fails HERE, loudly, instead of silently per-call.
+                # Eagerly validate the SDK *call signature* (append/user) so a
+                # broken integration fails HERE, loudly, instead of silently
+                # per-call. This does NOT contact the server or validate the
+                # key itself — the key is proven on the first real call, and
+                # any failure there is equally loud (see _fail_loud).
                 from xai_sdk.chat import user as _user
                 probe = self._client.chat.create(model="grok-3")
                 probe.append(_user("ok"))
@@ -381,7 +413,17 @@ class LLMClient:
 
     def critique_decision(self, raw_text: str, invoice: Dict[str, Any],
                           validation: Dict[str, Any], decision: Dict[str, Any],
-                          inventory_skus: Optional[List[str]] = None) -> Dict[str, Any]:
+                          inventory_skus: Optional[List[str]] = None,
+                          tools: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Critic with tool use. In Grok mode with tools provided, Grok runs a
+        ReAct loop: it chooses which tools to call and its reasoning trace is
+        recorded. Any failure falls back to the local critic, loudly."""
+        if self.mode == "grok" and tools:
+            result = self._critique_react(raw_text, invoice, validation,
+                                         decision, inventory_skus, tools)
+            if result is not None:
+                return result
+            # ReAct failed loudly inside _critique_react; fall through to local.
         if self.mode == "grok":
             sku_ctx = (f"Known inventory SKUs: {', '.join(inventory_skus)}\n"
                        if inventory_skus else "")
@@ -397,3 +439,46 @@ class LLMClient:
                 return data
         return self.local.critique(raw_text, invoice, validation, decision,
                                    inventory_skus)
+
+    def _critique_react(self, raw_text: str, invoice: Dict[str, Any],
+                        validation: Dict[str, Any], decision: Dict[str, Any],
+                        inventory_skus: Optional[List[str]],
+                        tools: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """ReAct loop: Grok decides which tools to call. Returns None if the
+        loop cannot complete (caller falls back to the local critic)."""
+        trace: List[Dict[str, Any]] = []
+        history: List[str] = []
+        base = dict(raw_text=raw_text[:3000],
+                    invoice_json=json.dumps(invoice)[:3000],
+                    validation_json=json.dumps(validation)[:3000],
+                    decision_json=json.dumps(decision)[:2000])
+        for step in range(4):
+            hist = ("\nTool results so far:\n" + "\n".join(history)) if history else ""
+            resp = self._grok_json(CRITIC_REACT_PROMPT.format(**base, history=hist))
+            if not isinstance(resp, dict):
+                self._fail_loud("critic_react", ValueError("non-JSON tool response"))
+                return None
+            thought = str(resp.get("thought", ""))[:300]
+            if resp.get("verdict") in ("uphold", "hold"):
+                trace.append({"step": step, "thought": thought,
+                              "verdict": resp["verdict"]})
+                return {"verdict": resp["verdict"],
+                        "notes": str(resp.get("notes", ""))[:500],
+                        "risk_flags": decision.get("risk_flags", []),
+                        "trace": trace}
+            tool_name, args = resp.get("tool"), resp.get("args") or {}
+            if tool_name not in tools or not isinstance(args, dict):
+                self._fail_loud("critic_react",
+                                ValueError(f"unknown tool: {tool_name!r}"))
+                return None
+            try:
+                result = tools[tool_name](**args)
+            except Exception as e:
+                result = {"error": f"{type(e).__name__}: {e}"}
+            trace.append({"step": step, "thought": thought,
+                          "tool": tool_name, "args": args,
+                          "result": str(result)[:500]})
+            history.append(f"{tool_name}({json.dumps(args)}) -> "
+                           f"{json.dumps(result)[:400]}")
+        self._fail_loud("critic_react", ValueError("no verdict within 4 steps"))
+        return None

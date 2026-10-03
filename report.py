@@ -45,11 +45,26 @@ def _badge(outcome: str) -> str:
 
 
 def write_report(results: List[PipelineResult], path: str = "report.html") -> str:
+    from src.agents.validation import ValidationAgent
     total = len(results)
     paid = sum(1 for r in results if r.outcome == "PAID")
     held = sum(1 for r in results if r.outcome == "HOLD_REVIEW")
     rejected = total - paid - held
     paid_sum = sum(r.invoice.total_amount or 0 for r in results if r.outcome == "PAID")
+    blocked_sum = sum(r.invoice.total_amount or 0 for r in results
+                      if r.outcome.startswith("REJECTED"))
+    held_sum = sum(r.invoice.total_amount or 0 for r in results
+                   if r.outcome == "HOLD_REVIEW")
+    # Overbilling caught: unexplained gaps between stated and expected totals.
+    overbilling = 0.0
+    for r in results:
+        if not r.outcome.startswith("REJECTED"):
+            continue
+        codes = {i.code for i in r.validation.issues}
+        if "subtotal_mismatch" in codes or "total_mismatch" in codes:
+            t = ValidationAgent._expected_totals(r.invoice)
+            if t["expected"] and r.invoice.total_amount:
+                overbilling += abs(r.invoice.total_amount - t["expected"])
 
     rows = []
     for r in results:
@@ -65,6 +80,13 @@ def write_report(results: List[PipelineResult], path: str = "report.html") -> st
         items = "".join(
             f"<div class='kv'><span class='mono'>{html.escape(i['item'])}</span> "
             f"x{i['quantity']}</div>" for i in inv["items"])
+        review_cmds = ""
+        if d["outcome"] == "HOLD_REVIEW" and inv["invoice_number"]:
+            num = html.escape(inv["invoice_number"], quote=True)
+            review_cmds = (
+                f"<div class='kv'>review: <span class='mono'>python review.py "
+                f"--approve {num} --note \"...\"</span> | "
+                f"<span class='mono'>python review.py --reject {num} --note \"...\"</span></div>")
         rows.append(f"""<tr>
 <td class="mono">{html.escape(os.path.basename(d['source_file']))}</td>
 <td>{_badge(d['outcome'])}</td>
@@ -75,6 +97,7 @@ def write_report(results: List[PipelineResult], path: str = "report.html") -> st
 <div class='kv'>reasoning: {html.escape(d['outcome_reason'][:300])}</div>
 <div class='kv'>risk: {flags or '—'}</div>
 <div class='kv'>run: <span class='mono'>{d['run_id']}</span></div>
+{review_cmds}
 </details></td></tr>""")
 
     page = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
@@ -83,10 +106,10 @@ def write_report(results: List[PipelineResult], path: str = "report.html") -> st
 <div class="sub">Generated {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} ·
 {total} invoices · multi-agent pipeline (ingest → validate → approve → pay)</div></header>
 <div class="cards">
-<div class="card"><div class="n" style="color:#4ade80">{paid}</div><div class="l">paid</div></div>
-<div class="card"><div class="n" style="color:#fbbf24">{held}</div><div class="l">held for review</div></div>
-<div class="card"><div class="n" style="color:#f87171">{rejected}</div><div class="l">rejected</div></div>
-<div class="card"><div class="n">${paid_sum:,.0f}</div><div class="l">paid out</div></div>
+<div class="card"><div class="n" style="color:#4ade80">${paid_sum:,.0f}</div><div class="l">paid ({paid} invoices)</div></div>
+<div class="card"><div class="n" style="color:#f87171">${blocked_sum:,.0f}</div><div class="l">blocked ({rejected} rejected)</div></div>
+<div class="card"><div class="n" style="color:#f87171">${overbilling:,.0f}</div><div class="l">overbilling caught</div></div>
+<div class="card"><div class="n" style="color:#fbbf24">${held_sum:,.0f}</div><div class="l">held for review ({held})</div></div>
 </div>
 <table><tr><th>file</th><th>outcome</th><th>vendor</th><th>amount</th><th>detail</th></tr>
 {''.join(rows)}</table></body></html>"""

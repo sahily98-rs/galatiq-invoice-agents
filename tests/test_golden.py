@@ -47,11 +47,25 @@ def test_golden_outcomes(pipeline):
 
 
 def test_duplicate_invoice_rejected(pipeline, tmp_path):
-    """Paying the same invoice number twice is refused (1004 pair)."""
+    """Paying the same invoice number twice is refused."""
+    r1 = pipeline.run(os.path.join(DATA, "invoice_1004.json"))
+    # A byte-identical resend (no revision marker) is a duplicate.
+    again = tmp_path / "invoice_1004_again.json"
+    again.write_text(open(os.path.join(DATA, "invoice_1004.json")).read(),
+                     encoding="utf-8")
+    r2 = pipeline.run(str(again))
+    assert r1.outcome == "PAID"
+    assert r2.outcome == "REJECTED_DUPLICATE"
+
+
+def test_revision_held_with_difference(pipeline, tmp_path):
+    """A revised invoice is held with the difference calculated, not rejected:
+    the vendor may legitimately be owed more."""
     r1 = pipeline.run(os.path.join(DATA, "invoice_1004.json"))
     r2 = pipeline.run(os.path.join(DATA, "invoice_1004_revised.json"))
     assert r1.outcome == "PAID"
-    assert r2.outcome == "REJECTED_DUPLICATE"
+    assert r2.outcome == "HOLD_REVIEW"
+    assert "4,050.00" in r2.outcome_reason  # 5940 - 1890
 
 
 def test_ledger_records_every_invoice(pipeline, tmp_path):
